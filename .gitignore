@@ -1,0 +1,22 @@
+﻿# Reference projects
+references/
+
+# Local Isolated Environment
+env/
+
+# Rust Build Output
+target/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.iml
+
+# Android & HarmonyOS build artifacts
+*.apk
+*.aab
+*.hap
+*.har
+*.so
+.gradle/
+build/
