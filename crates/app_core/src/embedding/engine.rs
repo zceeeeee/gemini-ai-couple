@@ -1,7 +1,7 @@
 //! 嵌入引擎接口与实现
 
-use crate::error::AppResult;
 use super::math::normalize_in_place;
+use crate::error::AppResult;
 
 /// 向量嵌入通用引擎 Trait
 pub trait EmbeddingEngine: Send + Sync {

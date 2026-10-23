@@ -1,14 +1,14 @@
-use std::path::Path;
-use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+use super::schema::{INIT_SQL_FALLBACK, INIT_SQL_TRIGRAM};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     L0Conversation, L1EpisodicMemory, L2SemanticFact, L3Narrative, L4Profile, MessageRole,
 };
-use super::schema::{INIT_SQL_FALLBACK, INIT_SQL_TRIGRAM};
 
 pub fn embedding_to_blob(vec: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(vec.len() * 4);
@@ -143,6 +143,56 @@ impl Database {
         // 按时间升序返回（适合作为 Prompt 上下文滑动窗口）
         list.reverse();
         Ok(list)
+    }
+
+    pub fn get_unconsolidated_conversations(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<L0Conversation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, session_id, role, content, created_at, metadata
+               FROM conversations
+               WHERE session_id = ?1 AND (metadata IS NULL OR metadata NOT LIKE '%"consolidated":true%')
+               ORDER BY created_at ASC, id ASC
+               LIMIT ?2"#,
+        )?;
+
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            let role_str: String = row.get(2)?;
+            let role = role_str.parse().unwrap_or(MessageRole::User);
+            Ok(L0Conversation {
+                id: Some(row.get(0)?),
+                session_id: row.get(1)?,
+                role,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                metadata: row.get(5)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn mark_conversations_consolidated(&self, ids: &[i64]) -> AppResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"UPDATE conversations
+               SET metadata = '{"consolidated":true}'
+               WHERE id = ?1"#,
+        )?;
+        for id in ids {
+            stmt.execute(params![id])?;
+        }
+        Ok(())
     }
 
     // ==========================================
@@ -281,6 +331,95 @@ impl Database {
         Ok(list)
     }
 
+    pub fn get_episodic_memory_by_id(&self, id: i64) -> AppResult<Option<L1EpisodicMemory>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, session_id, content, emotion, embedding,
+                      stability, difficulty, retrievability,
+                      last_recalled_at, recall_count, status,
+                      created_at, updated_at, metadata
+               FROM episodic_memories
+               WHERE id = ?1"#,
+        )?;
+
+        let res = stmt
+            .query_row(params![id], |row| {
+                let blob_opt: Option<Vec<u8>> = row.get(4)?;
+                let embedding = blob_opt.map(|b| blob_to_embedding(&b));
+                Ok(L1EpisodicMemory {
+                    id: Some(row.get(0)?),
+                    session_id: row.get(1)?,
+                    content: row.get(2)?,
+                    emotion: row.get(3)?,
+                    embedding,
+                    stability: row.get(5)?,
+                    difficulty: row.get(6)?,
+                    retrievability: row.get(7)?,
+                    last_recalled_at: row.get(8)?,
+                    recall_count: row.get(9)?,
+                    status: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    metadata: row.get(13)?,
+                })
+            })
+            .optional()?;
+        Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_episodic_fsrs(
+        &self,
+        id: i64,
+        stability: f64,
+        difficulty: f64,
+        retrievability: f64,
+        last_recalled_at: i64,
+        recall_count: u32,
+        status: &str,
+        updated_at: i64,
+    ) -> AppResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"UPDATE episodic_memories
+               SET stability = ?1,
+                   difficulty = ?2,
+                   retrievability = ?3,
+                   last_recalled_at = ?4,
+                   recall_count = ?5,
+                   status = ?6,
+                   updated_at = ?7
+               WHERE id = ?8"#,
+            params![
+                stability,
+                difficulty,
+                retrievability,
+                last_recalled_at,
+                recall_count,
+                status,
+                updated_at,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_forgotten_memories(
+        &self,
+        session_id: &str,
+        threshold: f64,
+        updated_at: i64,
+    ) -> AppResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            r#"UPDATE episodic_memories
+               SET status = 'archived', updated_at = ?1
+               WHERE session_id = ?2 AND status = 'active' AND retrievability < ?3"#,
+            params![updated_at, session_id, threshold],
+        )?;
+        Ok(changed)
+    }
+
     // ==========================================
     // L2: 语义事实 (Semantic Facts)
     // ==========================================
@@ -319,6 +458,57 @@ impl Database {
                       valid_from, valid_to, source_event_id,
                       created_at, updated_at
                FROM semantic_facts
+               ORDER BY updated_at DESC"#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(L2SemanticFact {
+                id: Some(row.get(0)?),
+                entity: row.get(1)?,
+                attribute: row.get(2)?,
+                value: row.get(3)?,
+                confidence: row.get(4)?,
+                valid_from: row.get(5)?,
+                valid_to: row.get(6)?,
+                source_event_id: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn invalidate_conflicting_facts(
+        &self,
+        entity: &str,
+        attribute: &str,
+        current_value: &str,
+        now: i64,
+    ) -> AppResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.execute(
+            r#"UPDATE semantic_facts
+               SET valid_to = ?1, updated_at = ?1
+               WHERE entity = ?2 AND attribute = ?3
+                 AND value != ?4 AND (valid_to IS NULL OR valid_to > ?1)"#,
+            params![now, entity, attribute, current_value],
+        )?;
+        Ok(count)
+    }
+
+    pub fn get_active_semantic_facts(&self) -> AppResult<Vec<L2SemanticFact>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, entity, attribute, value, confidence,
+                      valid_from, valid_to, source_event_id,
+                      created_at, updated_at
+               FROM semantic_facts
+               WHERE valid_to IS NULL
                ORDER BY updated_at DESC"#,
         )?;
 
@@ -538,9 +728,7 @@ impl Database {
     pub fn get_profile_value(&self, key: &str) -> AppResult<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT value FROM profiles WHERE key = ?1")?;
-        let res = stmt
-            .query_row(params![key], |row| row.get(0))
-            .optional()?;
+        let res = stmt.query_row(params![key], |row| row.get(0)).optional()?;
         Ok(res)
     }
 

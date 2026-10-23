@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use app_core::embedding::{DeterministicEmbeddingEngine, EmbeddingEngine};
 use app_core::models::{
     L0Conversation, L1EpisodicMemory, L2SemanticFact, L3Narrative, MessageRole,
 };
 use app_core::retrieval::HybridRetriever;
 use app_core::storage::Database;
+use std::sync::Arc;
 
 #[test]
 fn test_phase1_storage_and_hybrid_retrieval() {
@@ -32,21 +32,28 @@ fn test_phase1_storage_and_hybrid_retrieval() {
     // 3. 验证 L1: 情景记忆与向量化
     let text1 = "用户提到自己平时最爱喝乌龙茶，尤其是少冰无糖。";
     let emb1 = embedding_engine.embed(text1).expect("Embed text1");
-    let mut mem1 = L1EpisodicMemory::default();
-    mem1.session_id = "test_session".to_string();
-    mem1.content = text1.to_string();
-    mem1.embedding = Some(emb1.clone());
-    mem1.emotion = Some("warm".to_string());
-    let mem1_id = db.add_episodic_memory(&mem1).expect("Failed to add L1 text1");
+    let mem1 = L1EpisodicMemory {
+        session_id: "test_session".to_string(),
+        content: text1.to_string(),
+        embedding: Some(emb1.clone()),
+        emotion: Some("warm".to_string()),
+        ..Default::default()
+    };
+    let mem1_id = db
+        .add_episodic_memory(&mem1)
+        .expect("Failed to add L1 text1");
     assert!(mem1_id > 0);
 
     let text2 = "今天下午三点用户去科技园区参加了技术面试。";
     let emb2 = embedding_engine.embed(text2).expect("Embed text2");
-    let mut mem2 = L1EpisodicMemory::default();
-    mem2.session_id = "test_session".to_string();
-    mem2.content = text2.to_string();
-    mem2.embedding = Some(emb2.clone());
-    db.add_episodic_memory(&mem2).expect("Failed to add L1 text2");
+    let mem2 = L1EpisodicMemory {
+        session_id: "test_session".to_string(),
+        content: text2.to_string(),
+        embedding: Some(emb2.clone()),
+        ..Default::default()
+    };
+    db.add_episodic_memory(&mem2)
+        .expect("Failed to add L1 text2");
 
     // 4. 验证 L2: 语义事实与 FTS5 触发器同步
     let fact = L2SemanticFact {
@@ -76,7 +83,8 @@ fn test_phase1_storage_and_hybrid_retrieval() {
     db.upsert_narrative(&narrative).expect("Failed to add L3");
 
     // 6. 验证 L4: 核心画像
-    db.set_profile("user_core", "name", "小明").expect("Failed to set L4");
+    db.set_profile("user_core", "name", "小明")
+        .expect("Failed to set L4");
     let profile_val = db
         .get_profile_value("name")
         .expect("Failed to get L4")
@@ -93,7 +101,10 @@ fn test_phase1_storage_and_hybrid_retrieval() {
         .expect("Hybrid retrieval failed");
 
     // 验证 L1 情景记忆中与“乌龙茶”相关的条目排在首位
-    assert!(!results.episodic_memories.is_empty(), "Episodic memories should not be empty");
+    assert!(
+        !results.episodic_memories.is_empty(),
+        "Episodic memories should not be empty"
+    );
     let top_episodic = &results.episodic_memories[0];
     assert!(
         top_episodic.memory.content.contains("乌龙茶"),
@@ -103,7 +114,10 @@ fn test_phase1_storage_and_hybrid_retrieval() {
     assert!(top_episodic.rrf_score > 0.0);
 
     // 验证 L2 语义事实召回
-    assert!(!results.semantic_facts.is_empty(), "Semantic facts should not be empty");
+    assert!(
+        !results.semantic_facts.is_empty(),
+        "Semantic facts should not be empty"
+    );
     assert_eq!(results.semantic_facts[0].fact.entity, "用户");
     assert_eq!(results.semantic_facts[0].fact.attribute, "喜好饮品");
     assert_eq!(results.semantic_facts[0].fact.value, "乌龙茶少冰");

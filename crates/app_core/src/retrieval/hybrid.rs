@@ -3,14 +3,14 @@
 //! 整合向量空间余弦相似度与 SQLite FTS5 BM25 词法检索，
 //! 借助 RRF 互惠排名进行最终排序。
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+use super::rrf::{reciprocal_rank_fusion, RrfConfig};
 use crate::embedding::{cosine_similarity, SharedEmbeddingEngine};
 use crate::error::AppResult;
 use crate::models::{L1EpisodicMemory, L2SemanticFact};
 use crate::storage::Database;
-use super::rrf::{reciprocal_rank_fusion, RrfConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredEpisodicMemory {
@@ -77,7 +77,8 @@ impl HybridRetriever {
         }
 
         // 按余弦相似度降序排序
-        vector_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        vector_candidates
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let vector_ranked_ids: Vec<i64> = vector_candidates.iter().map(|(id, _)| *id).collect();
         let vector_sim_map: HashMap<i64, f32> = vector_candidates.into_iter().collect();
 
@@ -113,8 +114,35 @@ impl HybridRetriever {
         Ok(scored_list)
     }
 
+    /// 结合 FSRS 记忆动力学 (时效与惊喜加权) 的情景记忆召回
+    pub fn retrieve_episodic_with_dynamics(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+        now_millis: i64,
+        dynamics_manager: &crate::dynamics::MemoryDynamicsManager,
+    ) -> AppResult<Vec<ScoredEpisodicMemory>> {
+        let mut list = self.retrieve_episodic(session_id, query, limit * 2)?;
+        for item in &mut list {
+            item.rrf_score =
+                dynamics_manager.calculate_dynamic_score(item.rrf_score, &item.memory, now_millis);
+        }
+        list.sort_by(|a, b| {
+            b.rrf_score
+                .partial_cmp(&a.rrf_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        list.truncate(limit);
+        Ok(list)
+    }
+
     /// 针对 L2 语义事实执行 FTS5 召回
-    pub fn retrieve_semantic(&self, query: &str, limit: usize) -> AppResult<Vec<ScoredSemanticFact>> {
+    pub fn retrieve_semantic(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> AppResult<Vec<ScoredSemanticFact>> {
         let list = self.db.search_semantic_fts(query, limit)?;
         let scored = list
             .into_iter()
